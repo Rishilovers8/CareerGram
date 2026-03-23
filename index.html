@@ -1666,10 +1666,16 @@ async function sbSaveVideo(userId,video){
   if(!window._sbKeyValid) return;
   try{
     await sb.from('cg_videos').upsert({
-      id:video.id,user_id:userId,title:video.title,duration:video.duration||'0:00',
-      views:video.views||'0',category:video.category||'',level:video.level||'intermediate',
-      thumbnail:video.thumbnail||'🎬',description:video.description||'',
-      video_data:video.videoData&&video.isCloud?video.videoData:'', // Store cloud URL only
+      id:video.id,
+      user_id:userId,
+      title:video.title,
+      duration:video.duration||'0:00',
+      views:video.views||'0',
+      category:video.category||'',
+      level:video.level||'intermediate',
+      thumbnail:video.thumbnail||'🎬',
+      description:video.description||'',
+      video_data:video.isCloud&&video.videoData?video.videoData:'',
       storage_path:video.storagePath||''
     },{onConflict:'id'});
   }catch(e){}
@@ -2751,11 +2757,23 @@ document.addEventListener('click',e=>{
 async function uploadFileToStorage(file, bucket, filePath){
   if(!window._sbKeyValid) return null;
   try{
-    const {data,error}=await sb.storage.from(bucket).upload(filePath,file,{cacheControl:'3600',upsert:true});
-    if(error) return null;
-    const {data:urlData}=sb.storage.from(bucket).getPublicUrl(filePath);
+    // Remove leading slash if any
+    const cleanPath=filePath.replace(/^\//,'');
+    const {data,error}=await sb.storage.from(bucket).upload(cleanPath, file, {
+      cacheControl:'3600',
+      upsert:true,
+      contentType: file.type
+    });
+    if(error){
+      showToast('Storage error: '+error.message,'error');
+      return null;
+    }
+    const {data:urlData}=sb.storage.from(bucket).getPublicUrl(cleanPath);
     return urlData?.publicUrl||null;
-  }catch(e){return null;}
+  }catch(e){
+    showToast('Upload failed: '+e.message,'error');
+    return null;
+  }
 }
 
 // =============================================
@@ -2779,60 +2797,89 @@ document.getElementById('uploadVideoBtn').addEventListener('click',async()=>{
   const cat=document.getElementById('vidCat').value;
   if(!title||!cat){showToast('Please fill title and category','error');return;}
   if(!_selVidFile){showToast('Please select a video','error');return;}
+
   const pw=document.getElementById('uploadProgressWrap');pw.style.display='block';
   const pb=document.getElementById('uploadProgressBar');
   const uid=ME?.userId||'me';
   const vidId='v_'+Date.now();
   const THUMB={Python:'🐍',React:'⚛️',AWS:'☁️',DevOps:'🐳','ML/AI':'🤖',JavaScript:'💛','Interview Prep':'🎯','System Design':'📐'};
-  // Animate progress to 40% while uploading
+
+  // Show uploading state
+  document.getElementById('uploadVideoBtn').disabled=true;
+  document.getElementById('uploadVideoBtn').textContent='Uploading...';
+
+  // Animate progress bar while uploading
   let fakeP=0;
-  const fakeIv=setInterval(()=>{fakeP=Math.min(fakeP+5,40);pb.style.width=fakeP+'%';},120);
-  showToast('⬆️ Uploading video...','success');
-  // Try Supabase Storage upload
-  const storagePath=`${uid}/${vidId}_${_selVidFile.name.replace(/[^a-z0-9.]/gi,'_')}`;
+  const fakeIv=setInterval(()=>{fakeP=Math.min(fakeP+3,85);pb.style.width=fakeP+'%';},200);
+
+  showToast('⬆️ Uploading to cloud...','success');
+
+  // Upload to Supabase Storage
+  const ext=_selVidFile.name.split('.').pop()||'mp4';
+  const storagePath=`${uid}/${vidId}.${ext}`;
   let videoUrl=await uploadFileToStorage(_selVidFile,'videos',storagePath);
+
   clearInterval(fakeIv);
-  // If Supabase Storage fails, use in-memory objectURL (session only)
+  pb.style.width='95%';
+
   const isCloud=!!videoUrl;
+
+  // If cloud upload failed, use objectURL as session fallback
   if(!isCloud){
     videoUrl=URL.createObjectURL(_selVidFile);
-    showToast('⚠️ Cloud upload failed — video visible this session only','error');
+    showToast('⚠️ Cloud upload failed — video only visible this session. Check Supabase Storage bucket.','error');
+  } else {
+    showToast('✅ Video uploaded to cloud!','success');
   }
-  pb.style.width='90%';
+
+  // Calculate duration estimate from file size
+  const sizeMB=_selVidFile.size/1048576;
+  const estSec=Math.round(sizeMB*8); // rough estimate
+  const durStr=Math.floor(estSec/60)+':'+String(estSec%60).padStart(2,'0');
+
   const newVid={
-    id:vidId,title,
-    duration:Math.floor(_selVidFile.size/1500000/60)+':'+String(Math.floor(_selVidFile.size/1500000%60)).padStart(2,'0'),
-    views:'0',category:cat,level:document.getElementById('vidLevel')?.value||'intermediate',
+    id:vidId, title,
+    duration:durStr,
+    views:'0',
+    category:cat,
+    level:document.getElementById('vidLevel')?.value||'intermediate',
     thumbnail:THUMB[cat]||'🎬',
     description:document.getElementById('vidDesc').value.trim(),
-    videoData:videoUrl,   // cloud URL or objectURL
-    isCloud,              // true = survives reload, false = session only
+    videoData:videoUrl,
+    isCloud,
     storagePath:isCloud?storagePath:''
   };
+
   if(!userVideos[uid]) userVideos[uid]=[];
   userVideos[uid].unshift(newVid);
-  // Save per-user key to avoid serializing all users
-  localStorage.setItem('cg_vids_'+uid,JSON.stringify(userVideos[uid].map(v=>({...v,videoData:v.isCloud?v.videoData:''}))));
-  userVideos[uid]=JSON.parse(localStorage.getItem('cg_vids_'+uid));
-  // Re-attach objectURL for session (cloud videos already have URL)
-  if(!isCloud) userVideos[uid][0].videoData=videoUrl;
-  sbSaveVideo(uid,{...newVid,videoData:isCloud?videoUrl:''});
+
+  // Save to localStorage — store cloud URL (not blob)
+  const saveVids=userVideos[uid].map(v=>({...v, videoData:v.isCloud?v.videoData:''}));
+  localStorage.setItem('cg_vids_'+uid, JSON.stringify(saveVids));
+
+  // Sync metadata to Supabase DB
+  sbSaveVideo(uid, newVid);
+
   pb.style.width='100%';
+
   setTimeout(()=>{
     ['vidTitle','vidDesc'].forEach(id=>document.getElementById(id).value='');
     document.getElementById('vidCat').value='';
+    const vidLvl=document.getElementById('vidLevel');
+    if(vidLvl) vidLvl.value='intermediate';
     document.getElementById('videoPreview').style.display='none';
     document.getElementById('videoPreview').src='';
-    document.getElementById('uploadVideoBtn').disabled=true;
+    document.getElementById('uploadVideoBtn').disabled=false;
+    document.getElementById('uploadVideoBtn').textContent='Upload';
     document.getElementById('uploadVideoBtn').style.opacity='.5';
-    pb.style.width='0%';pw.style.display='none';
-    _selVidFile=null;document.getElementById('videoFileInp').value='';
+    document.getElementById('uploadVideoBtn').disabled=true;
+    pb.style.width='0%'; pw.style.display='none';
+    _selVidFile=null; document.getElementById('videoFileInp').value='';
     document.getElementById('videoUploadArea').innerHTML=`<div style="font-size:48px;margin-bottom:12px;">🎬</div><div style="color:var(--text);font-size:15px;font-weight:600;">Upload Video Tutorial</div><div style="color:var(--text2);font-size:12px;margin-top:4px;">MP4, MOV, AVI • Max 500MB</div>`;
     document.getElementById('videoUploadModal').classList.remove('open');
-    renderCourses();renderReels();
+    renderCourses(); renderReels();
     if(state.currentProfileId===uid) renderCreatorVideos(uid);
-    showToast(isCloud?'✅ Video uploaded to cloud!':'✅ Video ready (this session)','success');
-  },400);
+  },600);
 });
 document.getElementById('videoModalClose').addEventListener('click',()=>document.getElementById('videoUploadModal').classList.remove('open'));
 document.getElementById('videoUploadModal').addEventListener('click',e=>{if(e.target===document.getElementById('videoUploadModal')) document.getElementById('videoUploadModal').classList.remove('open');});
